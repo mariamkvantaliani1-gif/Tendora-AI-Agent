@@ -2,9 +2,10 @@
 
 ამ ფაილს იყენებს როგორც main.py (Terminal), ასევე app.py (Streamlit).
 API გასაღები იკითხება GROQ_API_KEY გარემოს ცვლადიდან (ან Colab Secrets-იდან).
+მონაცემები (იდეები, ბიზნესის პროფილი) ინახება თითო საუბარზე (thread_id) ცალკე,
+ამიტომ სხვადასხვა მომხმარებელი ერთმანეთის მონაცემებს ვერ ხედავს.
 """
 import datetime
-import json
 import os
 import xml.etree.ElementTree as ET
 from typing import Annotated, Literal
@@ -14,6 +15,7 @@ import requests
 from typing_extensions import TypedDict
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, trim_messages
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
@@ -23,7 +25,9 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, interrupt
 
 MODEL = "openai/gpt-oss-120b"
-DB = os.environ.get("TRENDORA_DB", "trendora_data.json")
+
+# მონაცემები საუბრების მიხედვით: {thread_id: {"ideas": [...], "profile": {...}}}
+STORE = {}
 
 
 # ---------------------------------------------------------------- გასაღები
@@ -67,57 +71,60 @@ AGENT_PROMPT = SYSTEM_KA + """
 - Tool-ის შედეგი გადმოეცი ქართულად, გამართულად და ადამიანურად."""
 
 
-# ---------------------------------------------------------------- შენახვა (JSON ფაილი)
-def _load():
-    if os.path.exists(DB):
-        with open(DB, encoding="utf-8") as f:
-            return json.load(f)
-    return {"ideas": [], "profile": {}}
+# ---------------------------------------------------------------- მონაცემები (თითო საუბარზე)
+def _uid(config):
+    return ((config or {}).get("configurable") or {}).get("thread_id", "default")
 
 
-def _save(data):
-    with open(DB, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def _load(uid):
+    return STORE.setdefault(uid, {"ideas": [], "profile": {}})
 
 
-def _profile_text():
-    p = _load()["profile"]
+def _save(uid, data):
+    STORE[uid] = data
+
+
+def _profile_text(uid):
+    p = _load(uid)["profile"]
     if not p:
         return "ბიზნესის პროფილი ჯერ არ არის შენახული."
     return f"ბიზნესი: {p.get('business')}; სამიზნე აუდიტორია: {p.get('audience')}; ტონი: {p.get('tone', '')}"
 
 
-def ask_llm(task: str) -> str:
-    msgs = [("system", SYSTEM_KA), ("human", f"{_profile_text()}\n\n{task}")]
+def ask_llm(task: str, config: RunnableConfig) -> str:
+    msgs = [("system", SYSTEM_KA), ("human", f"{_profile_text(_uid(config))}\n\n{task}")]
     return get_llm_long().invoke(msgs).content
 
 
 # ---------------------------------------------------------------- Tools
+# config: RunnableConfig ავტომატურად გადაეცემა Tool-ს და მოდელს არ ეჩვენება.
 @tool
-def save_business_profile(business: str, audience: str, tone: str = "") -> str:
+def save_business_profile(business: str, audience: str, config: RunnableConfig, tone: str = "") -> str:
     """Save the user's business field, target audience and preferred tone. Use this when the user describes their business."""
-    data = _load()
+    uid = _uid(config)
+    data = _load(uid)
     data["profile"] = {"business": business, "audience": audience, "tone": tone}
-    _save(data)
+    _save(uid, data)
     return "ბიზნესის პროფილი შენახულია."
 
 
 @tool
-def save_idea(title: str, details: str = "", category: str = "ზოგადი", platform: str = "ნებისმიერი") -> str:
+def save_idea(title: str, config: RunnableConfig, details: str = "", category: str = "ზოგადი", platform: str = "ნებისმიერი") -> str:
     """Save a content idea with a category and platform so ideas stay organized."""
-    data = _load()
+    uid = _uid(config)
+    data = _load(uid)
     new_id = max([i["id"] for i in data["ideas"]], default=0) + 1
     data["ideas"].append({"id": new_id, "title": title, "details": details,
                           "category": category, "platform": platform,
                           "created": str(datetime.date.today())})
-    _save(data)
+    _save(uid, data)
     return f"იდეა შენახულია (ნომერი {new_id}): {title}"
 
 
 @tool
-def list_ideas(category: str = "") -> str:
+def list_ideas(config: RunnableConfig, category: str = "") -> str:
     """List saved content ideas, optionally filtered by category."""
-    ideas = _load()["ideas"]
+    ideas = _load(_uid(config))["ideas"]
     if category:
         ideas = [i for i in ideas if i["category"] == category]
     if not ideas:
@@ -126,32 +133,33 @@ def list_ideas(category: str = "") -> str:
 
 
 @tool
-def delete_idea(idea_id: int, confirmed: bool = False) -> str:
+def delete_idea(idea_id: int, config: RunnableConfig, confirmed: bool = False) -> str:
     """Delete a saved idea by its number. Call with confirmed=false; the system itself asks the user for approval before deletion."""
     if not confirmed:
         return f"საჭიროა დადასტურება: ნამდვილად გსურთ #{idea_id} იდეის წაშლა?"
-    data = _load()
+    uid = _uid(config)
+    data = _load(uid)
     data["ideas"] = [i for i in data["ideas"] if i["id"] != idea_id]
-    _save(data)
+    _save(uid, data)
     return f"იდეა #{idea_id} წაიშალა."
 
 
 @tool
-def create_content_calendar(period: str, goal: str, platforms: str = "Instagram, TikTok") -> str:
+def create_content_calendar(period: str, goal: str, config: RunnableConfig, platforms: str = "Instagram, TikTok") -> str:
     """Create a content calendar. period is 'კვირა' (7 days) or 'თვე' (30 days). goal is the business goal or theme."""
     days = 7 if period.startswith("კვირ") or period.lower().startswith("week") else 30
     start = datetime.date.today()
     dates = ", ".join(str(start + datetime.timedelta(d)) for d in range(days))
     return ask_llm(f"შექმენი {days} დღიანი კონტენტ-კალენდარი ცხრილის სახით (თარიღი | პლატფორმა | ფორმატი | თემა | მოკლე იდეა). "
-                   f"თარიღები: {dates}. მიზანი: {goal}. პლატფორმები: {platforms}.")
+                   f"თარიღები: {dates}. მიზანი: {goal}. პლატფორმები: {platforms}.", config)
 
 
 @tool
-def write_content(platform: str, content_format: str, idea: str) -> str:
+def write_content(platform: str, content_format: str, idea: str, config: RunnableConfig) -> str:
     """Write an Instagram post, a Reels script or a TikTok script. content_format examples: 'პოსტი', 'Reels სცენარი', 'TikTok სცენარი'."""
     return ask_llm(f"დაწერე {platform} {content_format} იდეაზე: {idea}. "
                    "სცენარის შემთხვევაში მიუთითე: ყურადღების მისაპყრობი პირველი 3 წამი (hook), სცენები დროით, ტექსტი ეკრანზე, "
-                   "ხმოვანი ტექსტი და მოწოდება მოქმედებისკენ (CTA).")
+                   "ხმოვანი ტექსტი და მოწოდება მოქმედებისკენ (CTA).", config)
 
 
 def _rss_titles(url, n=8):
@@ -179,13 +187,13 @@ def get_trends(topic: str = "social media marketing") -> str:
 
 
 @tool
-def repurpose_idea(idea: str, platforms: str = "Instagram, TikTok, Facebook, LinkedIn") -> str:
+def repurpose_idea(idea: str, config: RunnableConfig, platforms: str = "Instagram, TikTok, Facebook, LinkedIn") -> str:
     """Adapt one content idea to several social platforms (content repurposing)."""
-    return ask_llm(f"ეს იდეა ადაპტირე თითოეული პლატფორმისთვის ცალ-ცალკე ფორმატით, სიგრძითა და ტონით: {idea}. პლატფორმები: {platforms}.")
+    return ask_llm(f"ეს იდეა ადაპტირე თითოეული პლატფორმისთვის ცალ-ცალკე ფორმატით, სიგრძითა და ტონით: {idea}. პლატფორმები: {platforms}.", config)
 
 
 @tool
-def best_posting_time(platform: str, audience: str = "") -> str:
+def best_posting_time(platform: str, config: RunnableConfig, audience: str = "") -> str:
     """Suggest the likely best time to publish content or run ads on a platform (Georgia time, UTC+4)."""
     base = {
         "instagram": "სამ-ხუთ 11:00-13:00 და 19:00-21:00",
@@ -193,19 +201,19 @@ def best_posting_time(platform: str, audience: str = "") -> str:
         "facebook": "ოთხ-პარ 12:00-15:00",
     }.get(platform.lower(), "სამუშაო დღეებში 18:00-21:00")
     return ask_llm(f"{platform}-ზე გამოქვეყნების საუკეთესო დრო საქართველოს დროით. ზოგადი სავარაუდო დრო: {base}. "
-                   f"აუდიტორია: {audience or 'იხილე პროფილი'}. აუხსენი მოკლედ და დაამატე, რომ ეს სავარაუდოა და საკუთარი Insights-ით უნდა გადაამოწმოს.")
+                   f"აუდიტორია: {audience or 'იხილე პროფილი'}. აუხსენი მოკლედ და დაამატე, რომ ეს სავარაუდოა და საკუთარი Insights-ით უნდა გადაამოწმოს.", config)
 
 
 @tool
-def hashtags_and_ad_copy(subject: str, platform: str = "Instagram") -> str:
+def hashtags_and_ad_copy(subject: str, config: RunnableConfig, platform: str = "Instagram") -> str:
     """Generate hashtags and short advertising copy for a product, service or post."""
-    return ask_llm(f"{platform}-ისთვის '{subject}'-ზე მომეცი: 15 ჰეშთეგი (ქართული და ინგლისური შერეული), 3 მოკლე სარეკლამო ტექსტი სხვადასხვა ტონით.")
+    return ask_llm(f"{platform}-ისთვის '{subject}'-ზე მომეცი: 15 ჰეშთეგი (ქართული და ინგლისური შერეული), 3 მოკლე სარეკლამო ტექსტი სხვადასხვა ტონით.", config)
 
 
 @tool
-def personalized_recommendations(question: str = "როგორ გავზარდო გაცნობიერება და გაყიდვები?") -> str:
+def personalized_recommendations(config: RunnableConfig, question: str = "როგორ გავზარდო გაცნობიერება და გაყიდვები?") -> str:
     """Give personalized content and marketing recommendations based on the saved business profile."""
-    return ask_llm(f"მომეცი 5 პერსონალიზებული, პრაქტიკული რეკომენდაცია ამ ბიზნესისთვის. კითხვა: {question}")
+    return ask_llm(f"მომეცი 5 პერსონალიზებული, პრაქტიკული რეკომენდაცია ამ ბიზნესისთვის. კითხვა: {question}", config)
 
 
 @tool
@@ -264,14 +272,15 @@ def route_after_assistant(state: AgentState):
     return "tools"
 
 
-def approval(state: AgentState) -> Command[Literal["tools", "assistant"]]:
+def approval(state: AgentState, config: RunnableConfig) -> Command[Literal["tools", "assistant"]]:
     """წაშლამდე გრაფი ჩერდება (interrupt) და მომხმარებლისგან დადასტურებას ითხოვს."""
     last = state["messages"][-1]
+    ideas = _load(_uid(config))["ideas"]
     new_calls, rejected = [], False
     for c in last.tool_calls:
         if c["name"] == "delete_idea":
             idea_id = c["args"].get("idea_id")
-            title = next((i["title"] for i in _load()["ideas"] if i["id"] == idea_id), "უცნობი იდეა")
+            title = next((i["title"] for i in ideas if i["id"] == idea_id), "უცნობი იდეა")
             answer = interrupt({
                 "action": "delete_idea",
                 "idea_id": idea_id,
@@ -312,15 +321,36 @@ def build_graph(checkpointer=None):
     return builder.compile(checkpointer=checkpointer or MemorySaver())
 
 
+# ---------------------------------------------------------------- შეცდომების გასაგები ტექსტი
+MSG_LIMIT = "⏳ მოდელის მოთხოვნების ლიმიტი ამოიწურა. დაელოდე ერთ წუთს და სცადე თავიდან."
+MSG_KEY = "🔑 API გასაღები არასწორია ან არ არის მითითებული."
+MSG_ERROR = "⚠️ ახლა AI სერვისთან დაკავშირება ვერ მოხერხდა. სცადე რამდენიმე წამში."
+
+
+def friendly_error(exc: Exception) -> str:
+    text = str(exc).lower()
+    if any(k in text for k in ("rate_limit", "rate limit", "429", "413", "too large")):
+        return MSG_LIMIT
+    if any(k in text for k in ("401", "invalid_api_key", "api key", "authentication")):
+        return MSG_KEY
+    return MSG_ERROR
+
+
 def run_turn(graph, config, user_text=None, resume=None):
     """ერთი ნაბიჯი: ან ახალი შეტყობინება (user_text), ან დადასტურების პასუხი (resume=True/False).
 
-    აბრუნებს {"type": "answer", "text": ...} ან {"type": "interrupt", "payload": {...}}.
+    აბრუნებს:
+      {"type": "answer", "text": ...}
+      {"type": "interrupt", "payload": {...}}   (საჭიროა დადასტურება)
+      {"type": "error", "text": ...}            (ლიმიტი ან API შეცდომა, გასაგები ტექსტით)
     """
-    if resume is not None:
-        result = graph.invoke(Command(resume=resume), config)
-    else:
-        result = graph.invoke({"messages": [("user", user_text)]}, config)
+    try:
+        if resume is not None:
+            result = graph.invoke(Command(resume=resume), config)
+        else:
+            result = graph.invoke({"messages": [("user", user_text)]}, config)
+    except Exception as exc:  # noqa: BLE001
+        return {"type": "error", "text": friendly_error(exc), "detail": str(exc)}
     if result.get("__interrupt__"):
         return {"type": "interrupt", "payload": result["__interrupt__"][0].value}
     return {"type": "answer", "text": result["messages"][-1].content}
