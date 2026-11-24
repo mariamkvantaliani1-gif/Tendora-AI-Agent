@@ -24,7 +24,7 @@ def main():
             answer = input("დაწერე 'დიახ' ან 'არა': ").strip().lower()
             out = run_turn(graph, config, resume=(answer in ("დიახ", "კი", "yes", "y")))
 
-        print("\nTrendora:", out["text"])
+        print("\nTrendora:", out["text"])  # პასუხი ან გასაგები შეცდომის ტექსტი
 
 
 if __name__ == "__main__":
